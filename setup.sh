@@ -140,7 +140,7 @@ fi
 cat >&2 <<EOF
 
 Done. Restart speech-dispatcher (it re-spawns automatically):
-  pkill -f speech-dispatcher
+  pkill -x speech-dispatch
 
 Then verify:
   spd-say -O             # should list: piper  (+ espeak-ng fallback)

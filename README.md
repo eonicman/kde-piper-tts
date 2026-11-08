@@ -21,8 +21,10 @@ cd kde-piper-tts
 ./VOICE=en_US-ryan-high ./setup.sh   # different voice instead
 ```
 
-Then restart any running speech-dispatcher (`pkill -f speech-dispatcher` — it re-spawns on the next client call) and try
+Then restart any running speech-dispatcher (`pkill -x speech-dispatch` — it re-spawns on the next client call) and try
 Tools → **Speak Text** in KWrite/Kate, or `spd-say "It works"`.
+
+Want to look around, hear other voices or change later? See [Choosing and changing voices](#choosing-and-changing-voices--piper-voices).
 
 ## What `setup.sh` does
 
@@ -81,7 +83,7 @@ Watch out: the list-flags are **case-sensitive.** `-o module` *sets* a module, `
 If a speech-dispatcher client silently speaks with the old voice: your module failed to load and speech-dispatcher fell back to espeak-ng with **no visible error**. Diagnose in the foreground:
 
 ```sh
-pkill -f speech-dispatcher
+pkill -x speech-dispatch
 mkdir -p /tmp/sd-diag
 timeout 12 /usr/bin/speech-dispatcher -s -l 5 -L /tmp/sd-diag
 grep -i error /tmp/sd-diag/*.log
@@ -95,14 +97,61 @@ grep -i error /tmp/sd-diag/*.log
 - **If `piper` errors with `libpiper_phonemize.so.1: cannot open shared object file`**, its library directory isn't on the loader path (common with manually installed/pip-style trees). Prefix the command with `LD_LIBRARY_PATH=/path/to/piper/libs` — the generated conf does this automatically when it detects the problem.
 - **Audio plays on whatever your default sink is.** Check with `pactl get-default-sink`; switch with `pactl set-default-sink <name>` or your Desktop audio settings.
 
-## Swapping voices
+## Choosing and changing voices — `piper-voices`
 
-Any voice from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) works — put `name.onnx` + `name.onnx.json` in `~/.local/share/piper/voices/`, then re-run `VOICE=<name> ./setup.sh` (or hand-edit the `--model` path and `AddVoice`/`DefaultVoice` lines in `piper-generic.conf`). The sample rate in the execute command is re-derived from the model config each run, so mixed-rate voices are safe. `length_scale > 1.0` slows the voice down; remove the flag for the model default.
+`setup.sh` installs one voice. **`piper-voices`** is the tool for looking around afterwards: see what you already have, find and download more, hear them, and pick one. It is a single Python 3 script (standard library only) that edits the same files `setup.sh` does, so the two can be mixed freely.
+
+```sh
+./piper-voices            # in a terminal: a friendly menu (interactive)
+```
+
+```
+Current voice: en_US-lessac-medium   speed: 1.1   wired: yes
+  1) Voices installed on this computer
+  2) Find and download more voices
+  3) Hear a voice
+  4) Use a voice as my default
+  5) Change speaking speed
+  6) Undo (back to the old default voice)
+```
+
+Or skip the menu and script it — nothing is ever asked in this mode:
+
+```sh
+./piper-voices list                                    # what's installed (* = current)
+./piper-voices catalog --lang en_GB --quality medium   # what you could download
+./piper-voices catalog --search amy
+./piper-voices download en_GB-alan-medium -y           # shows the model card, then fetches (md5-checked)
+./piper-voices preview en_GB-alan-medium "Hello there" # hear it, nothing changes
+./piper-voices set en_GB-alan-medium --speed 1.1       # make it the default and restart speech-dispatcher
+./piper-voices speed 1.0                               # same voice, different pace
+./piper-voices status
+./piper-voices unwire                                  # go back to what you had before
+```
+
+Good to know:
+
+- **Licenses differ per voice.** `download` prints the voice's model card first. Reading text on your own desktop is one thing; using a voice in a published video or product is another — check the dataset terms.
+- **Your existing `speechd.conf` is never edited silently.** If you already have one, `set`/`wire` shows exactly what will change (a `.kde-piper-backup` copy, any existing `DefaultModule` lines switched off, one marked block added) and asks first; with no terminal it refuses unless you pass `--yes`. `unwire` puts the file back exactly as it was.
+- **Speed** is Piper's `length_scale`: `1.0` is the voice's normal pace, higher is slower (`1.1` is what `setup.sh` uses), lower is faster.
+- **Multi-speaker voices** (a few have dozens) take `-s N`: `./piper-voices set en_GB-vctk-medium -s 7`.
+- The chosen voice answers for your desktop's language and for English, so an app asking for either gets it.
+- Downloads go to `~/.local/share/piper/voices/` (override with `PIPER_VOICE_DIR`). `~/.local/share/piper-voices/` is also scanned.
+- Re-running `setup.sh` resets the voice to its default (`VOICE=...` to choose another); use `piper-voices` for day-to-day changes.
+
+### Swapping voices by hand
+
+Any voice from [rhasspy/piper-voices](https://huggingface.co/rhasspy/piper-voices) works — put `name.onnx` + `name.onnx.json` in `~/.local/share/piper/voices/`, then re-run `VOICE=<name> ./setup.sh` (or hand-edit the `--model` path and `AddVoice`/`DefaultVoice` lines in `piper-generic.conf`). The sample rate in the execute command is re-derived from the model config each run, so mixed-rate voices are safe.
 
 ## Files
 
-- `setup.sh` — end-to-end setup (idempotent; refuses to touch an existing `speechd.conf`)
-- `piper-generic.conf` — the `sd_generic` wrapper it installs
+- `setup.sh` — end-to-end first-time setup (idempotent; refuses to touch an existing `speechd.conf`)
+- `piper-voices` — list / download / preview / choose voices, interactive or scripted
+- `piper-generic.conf` — the `sd_generic` wrapper `setup.sh` installs (`piper-voices` regenerates it)
+
+## Authors
+
+Hermes and Ghost, of [Built by Bots](https://builtbybots.show).
 
 ## License
 

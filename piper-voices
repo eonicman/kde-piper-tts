@@ -1,0 +1,631 @@
+#!/usr/bin/env python3
+"""piper-voices -- see, download, preview and choose Piper voices for KDE text-to-speech.
+
+Part of kde-piper-tts, by Hermes and Ghost of Built by Bots (BBB).  MIT licensed.
+
+setup.sh wires ONE Piper voice into speech-dispatcher.  This tool lets you look
+around and change your mind afterwards:
+
+  * show the Piper voices already installed on this computer
+  * browse the public catalog (rhasspy/piper-voices) and download voices you like,
+    after showing each voice's model card (check the license before commercial use)
+  * hear a voice before committing to it
+  * make a voice your default for KWrite, Kate, Orca, spd-say ... everything that
+    talks to speech-dispatcher, and adjust its speaking speed
+
+Interactive (a menu, when run in a terminal):   ./piper-voices
+Scripted (no questions):                        ./piper-voices list | catalog | download |
+                                                preview | set | speed | wire | unwire | status
+
+It edits the same files setup.sh does (~/.config/speech-dispatcher/piper-generic.conf and
+the marked block in speechd.conf), so the two tools can be mixed freely.  Python 3 standard
+library only.  Needs: piper, pacat (pipewire-pulse), speech-dispatcher.
+"""
+
+import argparse
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+CATALOG_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/voices.json"
+FILE_BASE = "https://huggingface.co/rhasspy/piper-voices/resolve/main/"
+PREVIEW_TEXT = "Hello! This is how I sound when I read your documents out loud."
+QUALITY_ORDER = ["x_low", "low", "medium", "high"]
+
+HOME = os.path.expanduser("~")
+DATA_HOME = os.environ.get("XDG_DATA_HOME") or os.path.join(HOME, ".local", "share")
+CONF_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+CACHE_HOME = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+
+# Same location setup.sh uses; a second spot is scanned too so voices fetched by other tools show up.
+VOICE_DIR = os.environ.get("PIPER_VOICE_DIR") or os.path.join(DATA_HOME, "piper", "voices")
+EXTRA_VOICE_DIRS = [os.path.join(DATA_HOME, "piper-voices")]
+SD_DIR = os.path.join(CONF_HOME, "speech-dispatcher")
+SPEECHD_CONF = os.path.join(SD_DIR, "speechd.conf")
+MODCONF = os.path.join(SD_DIR, "piper-generic.conf")
+CATALOG_CACHE = os.path.join(CACHE_HOME, "kde-piper-tts", "voices.json")
+SYSTEM_SPEECHD_CONF = "/etc/speech-dispatcher/speechd.conf"
+ESPEAK_CONF = "/etc/speech-dispatcher/modules/espeak-ng.conf"
+MARK_START = "# >>> kde-piper-tts >>>"        # identical to setup.sh so both tools agree
+MARK_END = "# <<< kde-piper-tts <<<"
+DISABLED = "# (disabled by kde-piper-tts) "
+
+
+# ----------------------------------------------------------------- helpers ---
+def die(msg, code=1):
+    print("error: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def ask(prompt, default=None):
+    suffix = f" [{default}]" if default else ""
+    try:
+        ans = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        return default or ""
+    return ans or (default or "")
+
+
+def confirm(prompt, assume_yes=False, default=False):
+    """True if the user agrees. Never blocks a script: with no terminal, only --yes says yes."""
+    if assume_yes:
+        return True
+    if not sys.stdin.isatty():
+        return False
+    ans = ask(prompt + (" [Y/n]" if default else " [y/N]")).lower()
+    return default if not ans else ans.startswith("y")
+
+
+def write_atomic(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)  # a half-written config can never be read
+
+
+# ------------------------------------------------------------ piper / audio --
+def find_piper():
+    """Return (exe, ld_dir_or_None, supports_quiet). Handles the libpiper_phonemize trap."""
+    exe = shutil.which("piper") or os.path.join(HOME, ".local", "bin", "piper")
+    if not os.access(exe, os.X_OK):
+        die("piper not found. Install it (pipx install piper-tts, or a release binary in ~/.local/bin).")
+    candidates = [None, os.path.join(os.path.dirname(os.path.dirname(exe)), "lib"),
+                  os.path.join(HOME, ".local", "lib"), "/usr/local/lib"]
+    for ld in candidates:
+        if ld and not glob.glob(os.path.join(ld, "libpiper_phonemize*")):
+            continue
+        env = dict(os.environ)
+        if ld:
+            env["LD_LIBRARY_PATH"] = ld + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+        r = subprocess.run([exe, "--help"], env=env, capture_output=True, text=True)
+        if r.returncode == 0:
+            return exe, ld, "--quiet" in (r.stdout + r.stderr)  # pip piper has no --quiet
+    die(f"'{exe}' will not start (missing libraries?). Try: {exe} --help")
+
+
+def find_pacat():
+    p = shutil.which("pacat") or ("/usr/bin/pacat" if os.access("/usr/bin/pacat", os.X_OK) else None)
+    if not p:
+        die("pacat not found (install pipewire-pulse / pulseaudio-utils).")
+    return p
+
+
+def synth_argv(model, rate, length_scale, speaker, exe_info):
+    exe, ld, quiet = exe_info
+    argv = [exe, "--model", model, "--output_raw"]
+    if quiet:
+        argv.append("--quiet")
+    if length_scale:
+        argv += ["--length_scale", str(length_scale)]
+    if speaker is not None:
+        argv += ["--speaker", str(speaker)]
+    return argv
+
+
+# ------------------------------------------------------------- installed ----
+def voice_dirs():
+    return [VOICE_DIR] + [d for d in EXTRA_VOICE_DIRS if os.path.isdir(d)]
+
+
+def installed_voices():
+    """{key: model_path} for every complete (.onnx + .onnx.json) voice found."""
+    found = {}
+    for d in voice_dirs():
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if fn.endswith(".onnx") and os.path.exists(os.path.join(d, fn + ".json")):
+                    found.setdefault(fn[:-5], os.path.join(d, fn))
+    return dict(sorted(found.items()))
+
+
+def voice_info(key):
+    model = installed_voices().get(key)
+    try:
+        with open(model + ".json") as f:
+            j = json.load(f)
+    except (OSError, TypeError, ValueError):
+        return {"speakers": 1, "lang": key.split("-")[0], "rate": 22050}
+    return {"speakers": j.get("num_speakers", 1),
+            "lang": (j.get("language") or {}).get("code") or key.split("-")[0],
+            "rate": (j.get("audio") or {}).get("sample_rate", 22050)}
+
+
+def read_current():
+    """What piper-generic.conf says right now: {'voice','length_scale','speaker'} or {}."""
+    try:
+        text = open(MODCONF).read()
+    except OSError:
+        return {}
+    m = re.search(r"--model\s+(\S+?)\.onnx", text)
+    if not m:
+        return {}
+    ls = re.search(r"--length_scale\s+([\d.]+)", text)
+    sp = re.search(r"--speaker\s+(\d+)", text)
+    return {"voice": os.path.basename(m.group(1)),
+            "length_scale": ls.group(1) if ls else None,
+            "speaker": int(sp.group(1)) if sp else None}
+
+
+# --------------------------------------------------------------- catalog ----
+def load_catalog(refresh=False):
+    """The Piper catalog, cached for a day. Returns {key: entry}."""
+    try:
+        if not refresh and os.path.exists(CATALOG_CACHE) and os.path.getmtime(CATALOG_CACHE) > time.time() - 86400:
+            with open(CATALOG_CACHE) as f:
+                return json.load(f)
+        req = urllib.request.Request(CATALOG_URL, headers={"User-Agent": "kde-piper-tts"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = r.read()
+        cat = json.loads(data)
+        os.makedirs(os.path.dirname(CATALOG_CACHE), exist_ok=True)
+        with open(CATALOG_CACHE, "wb") as f:
+            f.write(data)
+        return cat
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        if os.path.exists(CATALOG_CACHE):  # an old copy beats nothing
+            print(f"(could not reach the catalog: {e}; showing the cached copy)", file=sys.stderr)
+            with open(CATALOG_CACHE) as f:
+                return json.load(f)
+        die(f"could not fetch the voice catalog: {e}")
+
+
+def catalog_filter(cat, lang=None, quality=None, search=None):
+    rows = []
+    for key, v in cat.items():
+        code, fam = v["language"]["code"].lower(), v["language"]["family"].lower()
+        if lang and lang.lower() not in (code, fam):
+            continue
+        if quality and v["quality"] != quality:
+            continue
+        if search and search.lower() not in key.lower():
+            continue
+        rows.append(v)
+    rows.sort(key=lambda v: (v["language"]["code"], v["name"],
+                             QUALITY_ORDER.index(v["quality"]) if v["quality"] in QUALITY_ORDER else 9))
+    return rows
+
+
+def download_size(v):
+    return sum(f["size_bytes"] for p, f in v["files"].items() if p.endswith((".onnx", ".onnx.json")))
+
+
+def fetch(url, dest, expect_md5=None):
+    """Download url -> dest atomically, checking the md5 the catalog published."""
+    req = urllib.request.Request(url, headers={"User-Agent": "kde-piper-tts"})
+    tmp, md5 = dest + ".part", hashlib.md5()
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(tmp, "wb") as out:
+            total, done = int(r.headers.get("Content-Length") or 0), 0
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                md5.update(chunk)
+                done += len(chunk)
+                if total and sys.stderr.isatty():
+                    print(f"\r  {os.path.basename(dest)}: {done * 100 // total}% ({human(done)})",
+                          end="", file=sys.stderr)
+        if sys.stderr.isatty():
+            print(file=sys.stderr)
+        if expect_md5 and md5.hexdigest() != expect_md5:
+            raise ValueError(f"checksum mismatch for {os.path.basename(dest)} (corrupted download?)")
+        os.replace(tmp, dest)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)  # never leave a partial file that looks like a voice
+        raise
+
+
+def model_card(v):
+    for path in v["files"]:
+        if path.endswith("MODEL_CARD"):
+            try:
+                req = urllib.request.Request(FILE_BASE + path, headers={"User-Agent": "kde-piper-tts"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.read().decode("utf-8", "replace").strip()
+            except (urllib.error.URLError, OSError):
+                return None
+    return None
+
+
+def do_download(key, assume_yes=False):
+    cat = load_catalog()
+    v = cat.get(key)
+    if not v:
+        for k, e in cat.items():  # the catalog also publishes short aliases
+            if key in e.get("aliases", []):
+                v, key = e, k
+                break
+    if not v:
+        die(f"'{key}' is not in the catalog. Try: piper-voices catalog --search {key.split('-')[0]}")
+    if key in installed_voices():
+        print(f"{key} is already installed.")
+        return key
+    size = download_size(v)
+    print(f"\n{key}  --  {v['language']['name_english']} ({v['language']['country_english']}), "
+          f"quality: {v['quality']}, speakers: {v['num_speakers']}, download: {human(size)}")
+    card = model_card(v)
+    print("\nModel card (check the license / dataset terms before using a voice commercially):")
+    print("  " + (card.replace("\n", "\n  ") if card else "(none published)") + "\n")
+    if not confirm(f"Download {human(size)} to {VOICE_DIR}?", assume_yes):
+        print("Skipped." if sys.stdin.isatty() or assume_yes else "Skipped (no terminal; pass -y to confirm).")
+        return None
+    os.makedirs(VOICE_DIR, exist_ok=True)
+    for path, f in v["files"].items():
+        if path.endswith((".onnx", ".onnx.json")):
+            fetch(FILE_BASE + path, os.path.join(VOICE_DIR, os.path.basename(path)), f["md5_digest"])
+    if card:  # keep the license text next to the voice
+        write_atomic(os.path.join(VOICE_DIR, key + ".MODEL_CARD.txt"), card + "\n")
+    print(f"Installed {key}.")
+    return key
+
+
+# ---------------------------------------------------------------- preview ---
+def do_preview(key, text=None, speaker=None, length_scale=None):
+    model = installed_voices().get(key)
+    if not model:
+        die(f"voice '{key}' is not installed. Installed: {', '.join(installed_voices()) or 'none'}")
+    info, ei, pacat = voice_info(key), find_piper(), find_pacat()
+    if length_scale is None:
+        length_scale = read_current().get("length_scale")
+    env = dict(os.environ)
+    if ei[1]:
+        env["LD_LIBRARY_PATH"] = ei[1] + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    p1 = subprocess.Popen(synth_argv(model, info["rate"], length_scale, speaker, ei), env=env,
+                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p2 = subprocess.Popen([pacat, "--raw", "--format=s16le", f"--rate={info['rate']}", "--channels=1",
+                           "--latency-msec=20"], stdin=p1.stdout)
+    p1.stdout.close()
+    try:
+        p1.stdin.write((text or PREVIEW_TEXT).encode("utf-8"))
+        p1.stdin.close()
+        p2.wait()
+        p1.wait()
+    except KeyboardInterrupt:
+        for p in (p1, p2):
+            p.send_signal(signal.SIGTERM)
+        print()
+
+
+# ----------------------------------------------- speech-dispatcher wiring -----
+def module_binary_dir():
+    for d in ("/usr/lib/speech-dispatcher/speech-dispatcher-modules", "/usr/lib/speech-dispatcher-modules",
+              "/usr/lib64/speech-dispatcher-modules", "/usr/libexec/speech-dispatcher-modules"):
+        if os.path.exists(os.path.join(d, "sd_generic")):
+            return d
+    hits = glob.glob("/usr/lib*/**/sd_generic", recursive=True)
+    if hits:
+        return os.path.dirname(hits[0])
+    die("speech-dispatcher's sd_generic module was not found (install speech-dispatcher).")
+
+
+def lang_families(key):
+    """Languages the chosen voice should answer to: its own, the desktop's, and English."""
+    fams = [voice_info(key)["lang"].split("_")[0].lower()]
+    loc = (os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "en").split("_")[0].split(".")[0].lower()
+    for f in (loc, "en"):
+        if f.isalpha() and 2 <= len(f) <= 3 and f != "posix" and f not in fams:  # skips "C" / "POSIX"
+            fams.append(f)
+    return fams
+
+
+def write_module_conf(key, length_scale, speaker):
+    model = installed_voices()[key]
+    if re.search(r"\s", model):
+        die("voice path contains spaces; speech-dispatcher can't run that. Move ~/.local/share/piper.")
+    info, ei, pacat = voice_info(key), find_piper(), find_pacat()
+    ld = f"LD_LIBRARY_PATH={ei[1]} " if ei[1] else ""
+    cmd = " ".join(synth_argv(model, info["rate"], length_scale, speaker, ei))
+    voices = "\n".join(f'AddVoice\t"{f}"\t"FEMALE1"\t"{key}"' for f in lang_families(key))
+    text = (
+        "# Generic output module for Speech Dispatcher: Piper TTS via sd_generic.\n"
+        "# Written by kde-piper-tts (setup.sh / piper-voices). Change the voice with: ./piper-voices\n"
+        "# --output_raw is HEADERLESS PCM (hence pacat --raw). Do NOT use $PLAY_COMMAND / aplay:\n"
+        "# on some PipeWire systems the raw ALSA route hangs. The sample rate comes from the voice's JSON.\n\n"
+        "Debug 0\n\n"
+        "GenericExecuteSynth \\\n"
+        f"\"printf %s \\'$DATA\\' | {ld}{cmd} | {pacat} --raw --format=s16le --rate={info['rate']}"
+        " --channels=1 --latency-msec=20\"\n\n"
+        'GenericSoundIconFolder "/usr/share/sounds/sound-icons/"\n\n'
+        f"{voices}\n\n"
+        f'DefaultVoice\t"{key}"\n')
+    write_atomic(MODCONF, text)
+
+
+def block_text():
+    mods = module_binary_dir()
+    return (f"{MARK_START}\n"
+            f'AddModule "piper"     "{mods}/sd_generic"   "{MODCONF}"  "piper.log"\n'
+            f'AddModule "espeak-ng" "{mods}/sd_espeak-ng" "{ESPEAK_CONF}"  "espeak-ng.log"\n'
+            "DefaultModule piper\n"
+            'LanguageDefaultModule "en"  "piper"\n'
+            f"{MARK_END}\n")
+
+
+def is_wired():
+    try:
+        return MARK_START in open(SPEECHD_CONF).read() and os.path.exists(MODCONF)
+    except OSError:
+        return False
+
+
+def strip_block(text):
+    out, skip = [], False
+    for line in text.splitlines():
+        if line.strip() == MARK_START:
+            skip = True
+        elif line.strip() == MARK_END:
+            skip = False
+        elif not skip:
+            out.append(line[len(DISABLED):] if line.startswith(DISABLED) else line)
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def do_wire(assume_yes=False):
+    """Make speech-dispatcher use Piper by default. Backs up and never edits silently."""
+    if is_wired():
+        print("Already wired into speech-dispatcher.")
+        return True
+    if not os.path.exists(SPEECHD_CONF):
+        if not os.path.exists(SYSTEM_SPEECHD_CONF):
+            die("speech-dispatcher doesn't look installed (no speechd.conf).")
+        base, backup = open(SYSTEM_SPEECHD_CONF).read(), False
+    else:
+        base, backup = open(SPEECHD_CONF).read(), True
+    clash = re.compile(r"\s*(DefaultModule|LanguageDefaultModule)\b")
+    active = [l for l in base.splitlines() if clash.match(l)]
+    if backup:  # the user's own file: say exactly what will change and ask first
+        print(f"{SPEECHD_CONF} already exists. To make Piper the default I would:")
+        print("  * save a backup copy next to it (.kde-piper-backup)")
+        if active:
+            print("  * switch off these existing lines (they would override Piper):")
+            for l in active:
+                print("      " + l.strip())
+        print("  * add a marked kde-piper-tts block at the end")
+        if not confirm("Go ahead?", assume_yes):
+            print("Not changed. (Run again with --yes, or add the block yourself; see the README.)")
+            return False
+    base = "\n".join(DISABLED + l if clash.match(l) else l for l in base.splitlines()) + "\n"
+    if backup and not os.path.exists(SPEECHD_CONF + ".kde-piper-backup"):
+        shutil.copy2(SPEECHD_CONF, SPEECHD_CONF + ".kde-piper-backup")
+    write_atomic(SPEECHD_CONF, base.rstrip("\n") + "\n\n" + block_text())
+    print("Wired: speech-dispatcher will use Piper by default.")
+    return True
+
+
+def do_unwire():
+    if not os.path.exists(SPEECHD_CONF):
+        print("Nothing to undo.")
+        return
+    write_atomic(SPEECHD_CONF, strip_block(open(SPEECHD_CONF).read()))  # also re-enables lines we disabled
+    restart_speechd()
+    print("Unwired. speech-dispatcher is back to its previous default.")
+    if os.path.exists(SPEECHD_CONF + ".kde-piper-backup"):
+        print(f"(Your original config is also kept at {SPEECHD_CONF}.kde-piper-backup)")
+
+
+def restart_speechd():
+    # It re-spawns on the next client call. Match the process NAME exactly (the kernel truncates
+    # "speech-dispatcher" to 15 chars) -- `pkill -f` would also kill any editor or shell that merely
+    # has a speech-dispatcher path on its command line.
+    for name in ("speech-dispatch", "sd_generic", "sd_espeak-ng"):
+        subprocess.run(["pkill", "-x", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def do_set(key, speaker=None, length_scale="keep", restart=True, assume_yes=False):
+    have = installed_voices()
+    if key not in have:
+        die(f"'{key}' is not installed. Installed: {', '.join(have) or 'none'}")
+    n = voice_info(key)["speakers"]
+    if speaker is not None and not 0 <= speaker < max(n, 1):
+        die(f"{key} has {n} speaker(s); choose 0..{n - 1}")
+    cur = read_current()
+    if length_scale == "keep":
+        length_scale = cur.get("length_scale")
+    elif length_scale in (None, "none"):
+        length_scale = None
+    elif not re.fullmatch(r"\d+(\.\d+)?", str(length_scale)) or float(length_scale) <= 0:
+        die("speed must be a positive number like 1.0 (normal), 1.1 (slower) or 0.9 (faster)")
+    write_module_conf(key, length_scale, speaker)
+    print(f"Voice: {key}" + (f", speaker {speaker}" if speaker is not None else "")
+          + f", speed {length_scale or 'model default'}")
+    wired = do_wire(assume_yes)
+    if wired and restart:
+        restart_speechd()
+        print("speech-dispatcher restarted. Try: spd-say -w 'It works', or KWrite -> Tools -> Speak Text.")
+
+
+# ------------------------------------------------------------ list / status --
+def do_list():
+    have, cur = installed_voices(), read_current().get("voice")
+    if not have:
+        print(f"No Piper voices installed in {VOICE_DIR}")
+        return
+    for key in have:
+        i = voice_info(key)
+        print(f" {'*' if key == cur else ' '} {key:<42} {i['lang']:<7} speakers:{i['speakers']}")
+    print("\n(* = your current voice)")
+
+
+def do_catalog(lang, quality, search, refresh):
+    rows = catalog_filter(load_catalog(refresh), lang, quality, search)
+    have = installed_voices()
+    if not rows:
+        print("No voices match.")
+        return rows
+    for n, v in enumerate(rows, 1):
+        tag = "installed" if v["key"] in have else human(download_size(v))
+        print(f" {n:>3}. {v['key']:<42} {v['quality']:<7} speakers:{v['num_speakers']:<3} {tag}")
+    print(f"\n{len(rows)} voice(s).")
+    return rows
+
+
+def do_status():
+    cur = read_current()
+    print(f"voice:        {cur.get('voice') or '(not set)'}")
+    print(f"speed:        {cur.get('length_scale') or 'model default'}  (1.0 normal, higher = slower)")
+    print(f"wired:        {'yes' if is_wired() else 'no'}  ({SPEECHD_CONF})")
+    print(f"voices dir:   {VOICE_DIR}  ({len(installed_voices())} installed)")
+    r = subprocess.run(["spd-say", "-O"], capture_output=True, text=True) if shutil.which("spd-say") else None
+    if r and r.returncode == 0:
+        print("modules:      " + ", ".join(l.strip() for l in r.stdout.splitlines()[1:] if l.strip()))
+
+
+# ------------------------------------------------------------ interactive ---
+def pick_installed(prompt):
+    have = list(installed_voices())
+    if not have:
+        print("No voices installed yet -- use option 2 first.")
+        return None
+    for n, k in enumerate(have, 1):
+        print(f"  {n}) {k}")
+    s = ask(prompt)
+    if s.isdigit() and 1 <= int(s) <= len(have):
+        return have[int(s) - 1]
+    return s if s in have else None
+
+
+def interactive():
+    print("piper-voices -- choose how your computer talks.      (kde-piper-tts, Built by Bots)\n")
+    while True:
+        cur = read_current()
+        print(f"Current voice: {cur.get('voice') or '(none)'}   speed: {cur.get('length_scale') or 'default'}"
+              f"   wired: {'yes' if is_wired() else 'no'}")
+        print("  1) Voices installed on this computer")
+        print("  2) Find and download more voices")
+        print("  3) Hear a voice")
+        print("  4) Use a voice as my default")
+        print("  5) Change speaking speed")
+        print("  6) Undo (back to the old default voice)")
+        print("  q) Quit")
+        c = ask("Choose").lower()
+        try:
+            if c in ("q", "quit", ""):
+                return
+            elif c == "1":
+                do_list()
+            elif c == "2":
+                interactive_download()
+            elif c in ("3", "4"):
+                key = pick_installed("Which voice?")
+                if key and c == "3":
+                    do_preview(key)
+                elif key:
+                    n, sp = voice_info(key)["speakers"], None
+                    if n > 1:
+                        s = ask(f"This voice has {n} speakers. Speaker number (0-{n - 1})", "0")
+                        sp = int(s) if s.isdigit() else 0
+                    do_set(key, sp)
+            elif c == "5" and cur.get("voice") in installed_voices():
+                s = ask("Speed: 1.0 normal, 1.2 slower, 0.9 faster (blank = model default)", cur.get("length_scale") or "")
+                do_set(cur["voice"], cur.get("speaker"), s or "none")
+            elif c == "6":
+                do_unwire()
+        except SystemExit:
+            pass  # die() already printed the reason; stay in the menu
+        print()
+
+
+def interactive_download():
+    lang = ask("Language (e.g. en, en_GB, de, fr; blank = all)", "en")
+    rows = do_catalog(lang or None, None, None, False)
+    s = ask("Number to download (blank = back)") if rows else ""
+    if s.isdigit() and 1 <= int(s) <= len(rows):
+        key = do_download(rows[int(s) - 1]["key"])
+        if key and confirm("Hear it now?", default=True):
+            do_preview(key)
+        if key and confirm("Make it your default voice?"):
+            do_set(key)
+
+
+# -------------------------------------------------------------------- main --
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="piper-voices", description=__doc__.split("\n\n")[0] +
+                                "\n\nRun with no arguments for a menu.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("list", help="show installed voices")
+    c = sub.add_parser("catalog", help="browse downloadable voices")
+    c.add_argument("--lang", help="e.g. en, en_GB, de"); c.add_argument("--quality", choices=QUALITY_ORDER)
+    c.add_argument("--search"); c.add_argument("--refresh", action="store_true")
+    d = sub.add_parser("download", help="download a voice by key")
+    d.add_argument("key"); d.add_argument("-y", "--yes", action="store_true", help="skip the question (model card still shown)")
+    pv = sub.add_parser("preview", help="hear a voice")
+    pv.add_argument("key"); pv.add_argument("text", nargs="?"); pv.add_argument("-s", "--speaker", type=int)
+    pv.add_argument("--speed", help="length_scale, e.g. 1.1")
+    s = sub.add_parser("set", help="make a voice your default")
+    s.add_argument("key"); s.add_argument("-s", "--speaker", type=int)
+    s.add_argument("--speed", default="keep", help="1.0 normal, 1.1 slower, 0.9 faster, 'none' = model default")
+    s.add_argument("--no-restart", action="store_true"); s.add_argument("-y", "--yes", action="store_true")
+    sp = sub.add_parser("speed", help="change speaking speed, keep the voice")
+    sp.add_argument("value", help="1.0 normal, 1.1 slower, 0.9 faster, 'none' = model default")
+    w = sub.add_parser("wire", help="make speech-dispatcher use Piper"); w.add_argument("-y", "--yes", action="store_true")
+    sub.add_parser("unwire", help="undo wire")
+    sub.add_parser("status", help="show current state")
+    a = p.parse_args(argv)
+
+    if a.cmd is None:
+        interactive() if sys.stdin.isatty() else p.print_help()
+    elif a.cmd == "list":
+        do_list()
+    elif a.cmd == "catalog":
+        do_catalog(a.lang, a.quality, a.search, a.refresh)
+    elif a.cmd == "download":
+        do_download(a.key, a.yes)
+    elif a.cmd == "preview":
+        do_preview(a.key, a.text, a.speaker, a.speed)
+    elif a.cmd == "set":
+        do_set(a.key, a.speaker, a.speed, not a.no_restart, a.yes)
+    elif a.cmd == "speed":
+        cur = read_current()
+        if not cur.get("voice") in installed_voices():
+            die("no current Piper voice; run: piper-voices set <voice>")
+        do_set(cur["voice"], cur.get("speaker"), a.value)
+    elif a.cmd == "wire":
+        sys.exit(0 if do_wire(a.yes) else 2)
+    elif a.cmd == "unwire":
+        do_unwire()
+    elif a.cmd == "status":
+        do_status()
+
+
+if __name__ == "__main__":
+    main()
